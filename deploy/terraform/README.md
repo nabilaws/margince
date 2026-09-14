@@ -1,15 +1,19 @@
 # Terraform: cloud deployment stacks
 
-Deployment-target Terraform root modules — one per cloud, starting with
-**AWS** — that stand up a complete Margince installation: the three role
-images (`api`, `worker`, `web`), a managed Postgres with `pgvector`, managed
-Redis, S3-compatible object storage, a secrets store with customer-managed
-encryption, and one routed host in front of `api` + `web` per the table in
+Deployment-target Terraform root modules — one per cloud — that stand up a
+complete Margince installation: the three role images (`api`, `worker`,
+`web`), a managed Postgres with `pgvector`, managed Redis, object storage, a
+secrets store with customer-managed encryption, and one routed host in front
+of `api` + `web` per the table in
 [`docs/deployment.md`](../../docs/deployment.md#routing).
 
-GCP and Azure are not built yet — this is deliberately AWS-first, not
-AWS-only forever. A later PR adds `deploy/terraform/gcp/` and
-`deploy/terraform/azure/` following the same shape.
+**AWS** ([`aws/README.md`](aws/README.md)) and **Azure**
+([`azure/README.md`](azure/README.md)) are both built. GCP is not built yet —
+this is deliberately not GCP-only-never; a later PR adds
+`deploy/terraform/gcp/` following the same shape. The Azure stack has its own
+documented gaps versus the AWS one (no blobstore adapter yet, ACR's weaker
+tag-immutability/scoping story) — see `azure/README.md`'s own "Known,
+documented gaps" section rather than assuming full parity between the two.
 
 ## Naming the conflict
 
@@ -33,11 +37,12 @@ don't file it" scoped to what shipped today.
 
 ## Shape
 
-Serverless containers (ECS Fargate — no cluster to operate) and a full
-managed stack (managed Postgres, managed Redis, object storage, secrets
-manager, image registry, one customer-managed KMS key over all of it — all
-provisioned by Terraform). See [`aws/README.md`](aws/README.md) for the full
-resource list, the security posture, and how to use it.
+Serverless containers (ECS Fargate on AWS, Container Apps on Azure — no
+cluster to operate on either) and a full managed stack (managed Postgres,
+managed Redis, object storage, a secrets store, image registry, one
+customer-managed key over all of it — all provisioned by Terraform). See
+[`aws/README.md`](aws/README.md) or [`azure/README.md`](azure/README.md) for
+each stack's full resource list, security posture, and how to use it.
 
 ## What this does NOT cover
 
@@ -52,7 +57,7 @@ operator's own traffic.)
 ## Using the stack
 
 ```bash
-cd deploy/terraform/aws
+cd deploy/terraform/aws   # or deploy/terraform/azure
 cp terraform.tfvars.example terraform.tfvars
 # edit terraform.tfvars
 terraform init
@@ -62,12 +67,14 @@ terraform apply
 
 **Local state is the default, and it is not the recommended posture beyond a
 one-off `terraform plan`.** Every stack's `versions.tf` carries a commented
-`backend "s3"` block — uncomment and fill it in with your own state bucket
-before an `apply` you intend to keep, or `terraform apply` writes RDS,
-Redis, and every generated credential from `secrets.tf` into a plaintext
-file on whatever machine ran it.
+remote-backend block (`backend "s3"` for AWS, `backend "azurerm"` for Azure)
+— uncomment and fill it in with your own state store before an `apply` you
+intend to keep, or `terraform apply` writes the managed database, cache, and
+every generated credential from that stack's own `secrets.tf` into a
+plaintext file on whatever machine ran it.
 
-Then follow [`aws/README.md`](aws/README.md) for the one-time steps Terraform
-does not do: bootstrapping the database roles
-(`scripts/deploy/db-bootstrap.sql`), mounting `margince.yaml`, and
+Then follow that stack's own README ([`aws/README.md`](aws/README.md),
+[`azure/README.md`](azure/README.md)) for the one-time steps Terraform does
+not do: bootstrapping the database roles
+(`scripts/deploy/db-bootstrap.sql`), mounting/writing `margince.yaml`, and
 building/pushing the three images to the registry Terraform created.

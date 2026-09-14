@@ -1,0 +1,58 @@
+# Copy to terraform.tfvars and fill in the values with no default below.
+
+# ---- Required, no default ----------------------------------------------------
+
+# Versionless Key Vault secret ID of a PFX certificate covering the host in
+# public_base_url, already imported into this stack's Key Vault (keyvault.tf's
+# own comment has the `az keyvault certificate import` command — the vault
+# must exist, i.e. a first `terraform apply` targeting just it, before this
+# can be filled in).
+tls_certificate_key_vault_secret_id = "https://margince-kv.vault.azure.net/secrets/tls-cert"
+
+# MARGINCE_PUBLIC_BASE_URL — the canonical external scheme+host.
+public_base_url = "https://crm.example.com"
+
+# MARGINCE_ADMIN_PASSWORD for the first boot. Rotate/remove per
+# docs/deployment.md once the organization exists.
+admin_bootstrap_password = "change-me-before-first-boot"
+
+# A real release version — a git SHA, MARGINCE_RELEASE_VERSION, anything but
+# "latest". Unlike the AWS stack's IMMUTABLE ECR repos, ACR does not refuse a
+# re-push to the same tag (acr.tf's own comment) — "no latest" here is a
+# release-discipline convention this stack asks of you, not something the
+# registry enforces the way ECR does. No default on purpose.
+image_tag = "2026.09.01"
+
+# ---- Optional — shown with their defaults ------------------------------------
+
+# azure_region             = "westeurope"
+# resource_group_name      = "margince"
+# name_prefix              = "margince"
+# environment              = "production"  # stamped as the Environment tag on every resource
+# vnet_cidr                = "10.20.0.0/16"
+# az_count                 = 2
+# api_min_replicas         = 2
+# api_max_replicas         = 4
+# worker_min_replicas      = 0
+# worker_max_replicas      = 3
+# web_min_replicas         = 2
+# web_max_replicas         = 4
+# api_cpu                  = 0.5
+# api_memory               = "1Gi"
+# worker_cpu               = 0.5
+# worker_memory            = "1Gi"
+# web_cpu                  = 0.25
+# web_memory               = "0.5Gi"
+# log_retention_days       = 30
+# acr_untagged_manifest_retention_days = 14
+# db_sku_name              = "B_Standard_B2s"
+# db_storage_mb            = 65536
+# db_version               = "16"
+# db_zone_redundant_ha     = true
+# db_backup_retention_days = 7
+# redis_sku_name           = "Standard"
+# redis_capacity           = 1
+# appgw_min_capacity       = 2
+# appgw_max_capacity       = 10
+# license_token            = ""
+# alert_email              = ""
