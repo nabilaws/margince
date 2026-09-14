@@ -55,4 +55,5 @@ image_tag = "2026.09.01"
 # appgw_min_capacity       = 2
 # appgw_max_capacity       = 10
 # license_token            = ""
+# enable_deep_monitoring   = false  # true adds the action group + metric alerts (alarms.tf)
 # alert_email              = ""

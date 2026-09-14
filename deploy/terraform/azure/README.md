@@ -224,7 +224,10 @@ around):
 - **CPU-credit alarms have no literal Azure equivalent** — `alarms.tf`
   watches `cpu_percent` (Postgres) and `serverLoad` (Redis) instead; see that
   file's own top comment for why neither platform exposes a credit-balance
-  metric the way AWS's T-family burstable instances do.
+  metric the way AWS's T-family burstable instances do. Off by default —
+  gated on `var.enable_deep_monitoring`, mirroring the AWS stack's matching
+  toggle. Log Analytics and every resource's own diagnostic settings stay on
+  regardless; only the alerting layer is optional.
 - **Worker's scale-from-zero is unverified** — `containerapps.tf`'s own
   comment on `azurerm_container_app.worker`'s `custom_scale_rule` states
   plainly that a cpu-type KEDA rule combined with `min_replicas = 0` was not

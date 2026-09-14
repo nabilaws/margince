@@ -22,8 +22,13 @@
 #
 # No subscription wired beyond the optional var.alert_email — an operator's
 # alert destination is theirs to own, same reasoning as the AWS stack.
+#
+# Every resource below is gated on var.enable_deep_monitoring (variables.tf),
+# so this whole file is a no-op when it's false, mirroring the AWS stack's
+# alarms.tf.
 
 resource "azurerm_monitor_action_group" "alerts" {
+  count               = var.enable_deep_monitoring ? 1 : 0
   name                = "${var.name_prefix}-alerts"
   resource_group_name = azurerm_resource_group.this.name
   short_name          = substr(var.name_prefix, 0, 12)
@@ -40,6 +45,7 @@ resource "azurerm_monitor_action_group" "alerts" {
 }
 
 resource "azurerm_monitor_metric_alert" "postgres_cpu" {
+  count               = var.enable_deep_monitoring ? 1 : 0
   name                = "${var.name_prefix}-postgres-cpu-high"
   resource_group_name = azurerm_resource_group.this.name
   scopes              = [azurerm_postgresql_flexible_server.this.id]
@@ -59,13 +65,14 @@ resource "azurerm_monitor_metric_alert" "postgres_cpu" {
   }
 
   action {
-    action_group_id = azurerm_monitor_action_group.alerts.id
+    action_group_id = azurerm_monitor_action_group.alerts[0].id
   }
 
   tags = merge(local.common_tags, { Name = "${var.name_prefix}-postgres-cpu-high", Component = "observability" })
 }
 
 resource "azurerm_monitor_metric_alert" "redis_server_load" {
+  count               = var.enable_deep_monitoring ? 1 : 0
   name                = "${var.name_prefix}-redis-server-load-high"
   resource_group_name = azurerm_resource_group.this.name
   scopes              = [azurerm_redis_cache.this.id]
@@ -83,7 +90,7 @@ resource "azurerm_monitor_metric_alert" "redis_server_load" {
   }
 
   action {
-    action_group_id = azurerm_monitor_action_group.alerts.id
+    action_group_id = azurerm_monitor_action_group.alerts[0].id
   }
 
   tags = merge(local.common_tags, { Name = "${var.name_prefix}-redis-server-load-high", Component = "observability" })

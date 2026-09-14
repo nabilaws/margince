@@ -310,14 +310,28 @@ variable "admin_bootstrap_password" {
   sensitive   = true
 }
 
+variable "enable_deep_monitoring" {
+  description = <<-EOT
+    Toggles alarms.tf's action group and metric alerts (Postgres CPU, Redis
+    serverLoad) entirely. Log Analytics itself and every resource's own
+    diagnostic settings stay on regardless — those are baseline "what
+    happened" observability every deployment keeps, not the alerting layer
+    this toggles. Off by default, same reasoning as the AWS stack's
+    matching `enable_deep_monitoring`.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "alert_email" {
   description = <<-EOT
-    Optional email address subscribed to alarms.tf's action group. Left empty
-    by default — an operator's alert destination is theirs to own, the same
-    reasoning the AWS stack gives for not creating an SNS subscription itself
-    (alarms.tf's own comment there). Azure's action group can hold this
-    receiver directly rather than needing a separate `aws sns subscribe`-style
-    step, so it is exposed as a variable instead.
+    Optional email address subscribed to alarms.tf's action group. Only
+    read when enable_deep_monitoring is true. Left empty by default — an
+    operator's alert destination is theirs to own, the same reasoning the
+    AWS stack gives for not creating an SNS subscription itself (alarms.tf's
+    own comment there). Azure's action group can hold this receiver
+    directly rather than needing a separate `aws sns subscribe`-style step,
+    so it is exposed as a variable instead.
   EOT
   type        = string
   default     = ""
