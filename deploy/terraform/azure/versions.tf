@@ -31,6 +31,17 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+    # entra.tf: the sign-in app registration, its enterprise-app assignment to
+    # the customer's existing security group, and its client secret.
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = "~> 2.53"
+    }
+    # entra.tf's client-secret rotation clock.
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 }
 
@@ -54,3 +65,10 @@ provider "azurerm" {
 # local map (see network.tf's locals.common_tags) merged onto each resource's
 # own tags instead. Environment/Component follow the same per-resource pattern
 # AWS uses.
+
+# Authenticates as whoever runs `terraform apply` (az login), in the tenant of
+# the subscription above. entra.tf needs that identity to hold Entra's
+# Application Administrator (or Cloud Application Administrator) role when
+# create_entra_app = true; with create_entra_app = false it only reads the
+# current tenant ID.
+provider "azuread" {}

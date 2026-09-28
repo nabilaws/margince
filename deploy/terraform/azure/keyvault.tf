@@ -21,15 +21,17 @@
 # provider `features` block, which turns off Terraform's own destroy-time
 # purge to match).
 resource "azurerm_key_vault" "this" {
-  name                          = "${var.name_prefix}-kv"
-  location                      = azurerm_resource_group.this.location
-  resource_group_name           = azurerm_resource_group.this.name
-  tenant_id                     = data.azurerm_client_config.current.tenant_id
-  sku_name                      = "premium" # premium: HSM-backed keys, required for the CMK key type below
-  enable_rbac_authorization     = true
-  purge_protection_enabled      = true
-  soft_delete_retention_days    = 90
-  public_network_access_enabled = false
+  name                       = "${var.name_prefix}-kv"
+  location                   = azurerm_resource_group.this.location
+  resource_group_name        = azurerm_resource_group.this.name
+  tenant_id                  = data.azurerm_client_config.current.tenant_id
+  sku_name                   = "premium" # premium: HSM-backed keys, required for the CMK key type below
+  enable_rbac_authorization  = true
+  purge_protection_enabled   = true
+  soft_delete_retention_days = 90
+  # Public endpoint only while operator_ip_allowlist is set (setup, laptop
+  # access); default-deny below lets in nothing else.
+  public_network_access_enabled = length(var.operator_ip_allowlist) > 0
 
   network_acls {
     # AzureServices bypass, not None: Storage/Postgres/ACR's own
@@ -40,6 +42,7 @@ resource "azurerm_key_vault" "this" {
     # secrets, a different caller than the CMK-consuming services themselves).
     bypass         = "AzureServices"
     default_action = "Deny"
+    ip_rules       = var.operator_ip_allowlist
   }
 
   tags = merge(local.common_tags, { Name = "${var.name_prefix}-kv", Component = "security" })

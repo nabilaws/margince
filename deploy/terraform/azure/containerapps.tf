@@ -6,17 +6,30 @@ resource "azurerm_container_app_environment" "this" {
   log_analytics_workspace_id = azurerm_log_analytics_workspace.this.id
   infrastructure_subnet_id   = azurerm_subnet.containerapps.id
 
-  # No public ingress on the environment itself — appgateway.tf is this
-  # stack's one public entry point, the same "ECS tasks have no public IP,
-  # only the ALB does" shape as the AWS stack (ecs.tf's
-  # network_configuration.assign_public_ip = false).
-  internal_load_balancer_enabled = true
+  # External: the environment gets a public load balancer, but only apps with
+  # external_enabled ingress are reachable through it, and that is the api app
+  # alone, through its edge (nginx) container. worker has no ingress. There is
+  # no gateway in front (templates/edge-nginx.conf.tftpl).
+  #
+  # Changing this on an existing environment forces Terraform to replace the
+  # environment and all three apps (README.md, "Moving from the Application
+  # Gateway layout").
+  internal_load_balancer_enabled = false
 
-  # network.tf's own azurerm_subnet.containerapps comment already sizes that
-  # subnet at /23 specifically for this — Consumption-only zone redundancy
-  # needs it, and a smaller subnet is refused at apply time regardless of
-  # this setting.
+  # Zone redundancy needs the environment's subnet at creation time
+  # (network.tf's azurerm_subnet.containerapps, /23).
   zone_redundancy_enabled = var.az_count >= 2
+
+  # A workload profiles environment running only the serverless Consumption
+  # profile: same per-second billing as a Consumption-only environment, but
+  # the Consumption-only type (legacy) does not support egress through NAT
+  # Gateway, so network.tf's NAT would not give api/worker a fixed outbound
+  # IP (learn.microsoft.com/azure/container-apps/networking). That fixed IP
+  # is what the Dataverse IP firewall allowlists (nat_egress_ip output).
+  workload_profile {
+    name                  = "Consumption"
+    workload_profile_type = "Consumption"
+  }
 
   tags = merge(local.common_tags, { Name = "${var.name_prefix}-env", Component = "compute" })
 }
@@ -34,6 +47,17 @@ resource "azurerm_container_app_environment_storage" "config" {
   access_mode                  = "ReadOnly"
 }
 
+# Read-write attachment store for api and worker (storage.tf's attachments
+# share), exposed to Margince as MARGINCE_BLOBSTORE_PATH.
+resource "azurerm_container_app_environment_storage" "attachments" {
+  name                         = "attachments"
+  container_app_environment_id = azurerm_container_app_environment.this.id
+  account_name                 = azurerm_storage_account.this.name
+  share_name                   = azurerm_storage_share.attachments.name
+  access_key                   = azurerm_storage_account.this.primary_access_key
+  access_mode                  = "ReadWrite"
+}
+
 locals {
   # DSNs/connection info assembled once in secrets.tf's own locals block
   # (local.owner_dsn, local.app_dsn, local.redis_host) — referenced from
@@ -49,11 +73,12 @@ locals {
     { name = "connector-state-key", key_vault_secret_id = azurerm_key_vault_secret.connector_state_key.versionless_id, env = "MARGINCE_CONNECTOR_STATE_KEY" },
     { name = "admin-password", key_vault_secret_id = azurerm_key_vault_secret.admin_password.versionless_id, env = "MARGINCE_ADMIN_PASSWORD" },
     { name = "license", key_vault_secret_id = azurerm_key_vault_secret.license.versionless_id, env = "MARGINCE_LICENSE" },
+    { name = "entra-client-secret", key_vault_secret_id = azurerm_key_vault_secret.entra_client_secret.versionless_id, env = "MARGINCE_GRAPH_CLIENT_SECRET" },
   ]
 
-  # MARGINCE_BLOBSTORE_* is deliberately absent — see storage.tf's own
-  # top-of-file comment: the Go blobstore client cannot talk to this
-  # account's native API, so there is nothing correct to point it at yet.
+  # Attachments use Margince's filesystem store on the attachments share
+  # (MARGINCE_BLOBSTORE_PATH), because its object-store client speaks S3 only
+  # and this account's blob API is not S3 (storage.tf).
   shared_env = [
     { name = "MARGINCE_CONFIG", value = "/app/config/margince.yaml" },
     # 6380: Azure Cache for Redis's TLS-only port (redis.tf's
@@ -62,7 +87,29 @@ locals {
     { name = "MARGINCE_REDIS_TLS", value = "true" },
     { name = "MARGINCE_PUBLIC_BASE_URL", value = var.public_base_url },
     { name = "MARGINCE_LOG_FORMAT", value = "json" },
+    { name = "MARGINCE_BLOBSTORE_PATH", value = "/app/blobstore" },
+    # Entra ID (entra.tf): one app for staff sign-in and Graph capture, pinned
+    # to the customer's tenant. MARGINCE_MICROSOFT_SIGNIN_TENANT is what turns
+    # Microsoft sign-in on and refuses every other directory.
+    { name = "MARGINCE_GRAPH_CLIENT_ID", value = local.entra_client_id },
+    { name = "MARGINCE_GRAPH_TENANT", value = local.entra_tenant_id },
+    { name = "MARGINCE_MICROSOFT_SIGNIN_TENANT", value = local.entra_tenant_id },
   ]
+
+  # The edge container's complete nginx config (templates/edge-nginx.conf.tftpl).
+  # Not a secret: it is passed as a plain environment variable and written to
+  # /tmp at start, so no file share or secret volume is involved.
+  edge_port = 8081
+  api_port  = 8080 # cmd/api's --addr default
+  edge_nginx_conf = templatefile("${path.module}/templates/edge-nginx.conf.tftpl", {
+    edge_port         = local.edge_port
+    api_port          = local.api_port
+    envoy_cidr        = azurerm_subnet.containerapps.address_prefixes[0]
+    break_glass_cidrs = var.break_glass_cidrs
+    auth_rate         = var.auth_rate_limit_per_minute
+  })
+
+  public_host = trimprefix(var.public_base_url, "https://")
 }
 
 resource "azurerm_container_app" "api" {
@@ -70,10 +117,14 @@ resource "azurerm_container_app" "api" {
   container_app_environment_id = azurerm_container_app_environment.this.id
   resource_group_name          = azurerm_resource_group.this.name
   revision_mode                = "Single"
+  workload_profile_name        = "Consumption"
 
   identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.api_worker.id]
+    type = "UserAssigned"
+    identity_ids = [
+      azurerm_user_assigned_identity.api_worker.id,
+      azurerm_user_assigned_identity.dataverse.id,
+    ]
   }
 
   registry {
@@ -90,15 +141,14 @@ resource "azurerm_container_app" "api" {
     }
   }
 
-  # appgateway.tf's backend_http_settings talks plain HTTP to this app on
-  # 8080 — same reasoning as alb.tf's own comment: cmd/api serves plain HTTP
-  # and terminates TLS ahead of itself, so allow_insecure_connections here is
-  # what lets Application Gateway (TLS already terminated at ITS edge) reach
-  # it without asking cmd/api to speak a protocol it does not implement.
+  # The one public ingress in the stack. It targets the edge container, never
+  # cmd/api directly: edge serves the SPA, applies the break-glass and rate
+  # rules, and forwards api paths to cmd/api on localhost. TLS ends at the
+  # environment's edge; HTTP is redirected to HTTPS.
   ingress {
-    external_enabled           = false
-    target_port                = 8080
-    allow_insecure_connections = true
+    external_enabled           = true
+    target_port                = local.edge_port
+    allow_insecure_connections = false
     traffic_weight {
       latest_revision = true
       percentage      = 100
@@ -112,6 +162,12 @@ resource "azurerm_container_app" "api" {
     volume {
       name         = "config"
       storage_name = azurerm_container_app_environment_storage.config.name
+      storage_type = "AzureFile"
+    }
+
+    volume {
+      name         = "attachments"
+      storage_name = azurerm_container_app_environment_storage.attachments.name
       storage_type = "AzureFile"
     }
 
@@ -141,6 +197,46 @@ resource "azurerm_container_app" "api" {
         name = "config"
         path = "/app/config"
       }
+
+      volume_mounts {
+        name = "attachments"
+        path = "/app/blobstore"
+      }
+    }
+
+    # edge: nginx from the web image (it carries the built SPA), sharing this
+    # replica's network namespace with cmd/api. See
+    # templates/edge-nginx.conf.tftpl. api_cpu + web_cpu and api_memory +
+    # web_memory must add up to a valid Consumption combination (the defaults
+    # give 0.75 vCPU / 1.5Gi).
+    container {
+      name    = "edge"
+      image   = "${azurerm_container_registry.this.login_server}/web:${var.image_tag}"
+      cpu     = var.web_cpu
+      memory  = var.web_memory
+      command = ["/bin/sh", "-c"]
+      args    = ["printf '%s' \"$NGINX_CONF\" > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]
+
+      env {
+        name  = "NGINX_CONF"
+        value = local.edge_nginx_conf
+      }
+
+      # Ready only once cmd/api answers through the edge, so a new replica
+      # takes no traffic while nginx is up and cmd/api is still starting.
+      # /healthz, not /readyz: readyz also weighs the AI and embedding state
+      # (compose/routes.go), which should not take replicas out of rotation.
+      readiness_probe {
+        transport = "HTTP"
+        port      = local.edge_port
+        path      = "/healthz"
+      }
+
+      liveness_probe {
+        transport = "HTTP"
+        port      = local.edge_port
+        path      = "/healthz"
+      }
     }
 
     # CPU utilization target-tracking, same 70% threshold as ecs.tf's own
@@ -166,10 +262,14 @@ resource "azurerm_container_app" "worker" {
   container_app_environment_id = azurerm_container_app_environment.this.id
   resource_group_name          = azurerm_resource_group.this.name
   revision_mode                = "Single"
+  workload_profile_name        = "Consumption"
 
   identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.api_worker.id]
+    type = "UserAssigned"
+    identity_ids = [
+      azurerm_user_assigned_identity.api_worker.id,
+      azurerm_user_assigned_identity.dataverse.id,
+    ]
   }
 
   registry {
@@ -196,6 +296,12 @@ resource "azurerm_container_app" "worker" {
     volume {
       name         = "config"
       storage_name = azurerm_container_app_environment_storage.config.name
+      storage_type = "AzureFile"
+    }
+
+    volume {
+      name         = "attachments"
+      storage_name = azurerm_container_app_environment_storage.attachments.name
       storage_type = "AzureFile"
     }
 
@@ -227,23 +333,17 @@ resource "azurerm_container_app" "worker" {
         name = "config"
         path = "/app/config"
       }
+
+      volume_mounts {
+        name = "attachments"
+        path = "/app/blobstore"
+      }
     }
 
-    # var.worker_min_replicas defaults to 0 (variables.tf's own comment:
-    # idle-cost traded for a cold start, since worker has no ingress to keep
-    # warm for). Azure Container Apps documents that a cpu-type custom scale
-    # rule needs an existing replica to sample and will not by itself lift
-    # min_replicas = 0 back to 1 — whether combining it with min_replicas = 0
-    # here is accepted at apply time, or silently never scales past zero,
-    # could not be confirmed from within the environment this stack was
-    # built in. If `terraform apply` rejects this combination, or worker
-    # never leaves zero replicas under real backlog, the fix is either
-    # bumping worker_min_replicas to 1 (variables.tf, same steady-cost
-    # tradeoff the AWS stack's own worker_desired_count default makes) or
-    # replacing this rule with a KEDA scaler type that documents scale-from-
-    # zero support against an external metric — this worker's own
-    # Redis-backed outbox relay depth is the natural one to reach for instead
-    # of guessing at unverified CPU-rule behavior.
+    # var.worker_min_replicas defaults to 1: a cpu-type rule needs a running
+    # replica to sample and cannot lift worker from zero on its own, and
+    # worker owns the periodic jobs (capture sync, AI passes) that must always
+    # run. This rule only adds replicas above that floor under load.
     custom_scale_rule {
       name             = "cpu-scaling"
       custom_rule_type = "cpu"
@@ -257,58 +357,18 @@ resource "azurerm_container_app" "worker" {
   tags = merge(local.common_tags, { Name = "${var.name_prefix}-worker", Component = "compute-worker" })
 }
 
-resource "azurerm_container_app" "web" {
-  name                         = "${var.name_prefix}-web"
-  container_app_environment_id = azurerm_container_app_environment.this.id
-  resource_group_name          = azurerm_resource_group.this.name
-  revision_mode                = "Single"
+# public_base_url's host on the api app (the public ingress). Two-phase (variables.tf,
+# bind_custom_domain): the DNS records must exist before this can be created.
+# The managed certificate is then issued and bound outside Terraform by
+# `az containerapp hostname bind` (README.md), which is why the certificate
+# fields are ignored here: azurerm ~> 3.117 cannot create a managed
+# certificate itself.
+resource "azurerm_container_app_custom_domain" "public" {
+  count            = var.bind_custom_domain ? 1 : 0
+  name             = local.public_host
+  container_app_id = azurerm_container_app.api.id
 
-  identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.web.id]
+  lifecycle {
+    ignore_changes = [certificate_binding_type, container_app_environment_certificate_id]
   }
-
-  registry {
-    server   = azurerm_container_registry.this.login_server
-    identity = azurerm_user_assigned_identity.web.id
-  }
-
-  # No secret blocks — web reads no secrets, mirroring execution_web's own
-  # empty grant set (identity.tf).
-
-  ingress {
-    external_enabled           = false
-    target_port                = 8080
-    allow_insecure_connections = true
-    traffic_weight {
-      latest_revision = true
-      percentage      = 100
-    }
-  }
-
-  template {
-    min_replicas = var.web_min_replicas
-    max_replicas = var.web_max_replicas
-
-    container {
-      name   = "web"
-      image  = "${azurerm_container_registry.this.login_server}/web:${var.image_tag}"
-      cpu    = var.web_cpu
-      memory = var.web_memory
-
-      env {
-        name  = "MARGINCE_LOG_FORMAT"
-        value = "json"
-      }
-    }
-
-    # No custom_scale_rule — mirrors ecs.tf's own web service, left
-    # un-autoscaled (static SPA/nginx, not CPU-bound the way api/worker are;
-    # see the AWS stack's README for the same call). Container Apps applies
-    # its own default HTTP-concurrency scale rule to any ingress-enabled app
-    # with none declared explicitly, which is what moves this service between
-    # web_min_replicas and web_max_replicas here.
-  }
-
-  tags = merge(local.common_tags, { Name = "${var.name_prefix}-web", Component = "compute-web" })
 }

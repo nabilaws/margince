@@ -1,0 +1,162 @@
+# Complete nginx config for the `edge` container, rendered by Terraform
+# (containerapps.tf) and written to /tmp/nginx.conf at container start.
+#
+# edge runs INSIDE the api app, beside the api container, from the web image
+# (which carries the built SPA). It is the app's ingress target: it serves the
+# SPA exactly as frontend/nginx.conf does and forwards every api-owned path to
+# the api container on localhost, keeping the public Host header intact. Keep
+# the SPA locations in step with frontend/nginx.conf.
+
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    sendfile on;
+    keepalive_timeout 65;
+    server_tokens off;
+    access_log /dev/stdout;
+
+    # The image runs as uid 101, which can only write under /tmp.
+    client_body_temp_path /tmp/client_temp;
+    proxy_temp_path       /tmp/proxy_temp;
+    fastcgi_temp_path     /tmp/fastcgi_temp;
+    uwsgi_temp_path       /tmp/uwsgi_temp;
+    scgi_temp_path        /tmp/scgi_temp;
+
+    # Real client address. Container Apps' ingress appends the caller as the
+    # rightmost X-Forwarded-For entry ("Only the rightmost IP is provided by
+    # Azure Container Apps", ingress-overview). Its proxy connects from inside
+    # the environment: the replica itself, the infrastructure subnet, or the
+    # ranges a workload profiles environment reserves (100.100.0.0/17 and
+    # three /19s inside 100.100.0.0/16). Only those sources are trusted, so a
+    # client's own X-Forwarded-For entries are ignored.
+    set_real_ip_from 127.0.0.1;
+    set_real_ip_from ${envoy_cidr};
+    set_real_ip_from 100.100.0.0/16;
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    # Password login only from the break-glass ranges. Everyone else signs in
+    # through Entra ID, where the customer's Conditional Access policy applies.
+    geo $break_glass {
+        default 0;
+%{ for cidr in break_glass_cidrs ~}
+        ${cidr} 1;
+%{ endfor ~}
+    }
+    map "$request_method:$break_glass" $block_password_login {
+        default   0;
+        "POST:0"  1;
+    }
+
+    limit_req_zone $binary_remote_addr zone=auth:10m rate=${auth_rate}r/m;
+    limit_req_status 429;
+
+    upstream margince_api {
+        server 127.0.0.1:${api_port};
+        keepalive 16;
+    }
+
+    server {
+        listen ${edge_port};
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        client_max_body_size 50m;
+
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Content-Type-Options "nosniff" always;
+
+        gzip on;
+        gzip_types text/css application/javascript application/json image/svg+xml;
+        gzip_min_length 1024;
+        gzip_vary on;
+
+        # The api builds OAuth discovery URLs, the MCP challenge and webhook
+        # signature bases from Host and X-Forwarded-Proto, so both carry what
+        # the client used.
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+
+        # ---- api paths -----------------------------------------------------
+
+        location = /v1/auth/login {
+            if ($block_password_login) { return 403; }
+            limit_req zone=auth burst=${auth_rate} nodelay;
+            proxy_pass http://margince_api;
+        }
+        # Microsoft sign-in (/v1/auth/oidc/*) is not limited here: Entra
+        # protects its own side, and staff behind one office address would
+        # otherwise share one bucket at 9:00.
+        location ~ ^/v1/auth/(forgot-password|reset-password) {
+            limit_req zone=auth burst=${auth_rate} nodelay;
+            proxy_pass http://margince_api;
+        }
+        location = /oauth/token {
+            limit_req zone=auth burst=${auth_rate} nodelay;
+            proxy_pass http://margince_api;
+        }
+        location /setup/ {
+            limit_req zone=auth burst=${auth_rate} nodelay;
+            proxy_pass http://margince_api;
+        }
+
+        location /v1/          { proxy_pass http://margince_api; }
+        location /webhooks/    { proxy_pass http://margince_api; }
+        location /oauth/       { proxy_pass http://margince_api; }
+        location /.well-known/oauth- { proxy_pass http://margince_api; }
+        location = /healthz    { proxy_pass http://margince_api; }
+        location = /readyz     { proxy_pass http://margince_api; }
+
+        # MCP answers with a single-event text/event-stream; do not buffer it.
+        location /mcp {
+            proxy_buffering off;
+            proxy_pass http://margince_api;
+        }
+
+        # Prometheus metrics stay inside the app.
+        location = /metrics { return 404; }
+
+        # ---- SPA (same as frontend/nginx.conf) -----------------------------
+
+        location /assets/ {
+            try_files $uri =404;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location = /index.html {
+            add_header Cache-Control "no-cache";
+            add_header Referrer-Policy "no-referrer" always;
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header X-Content-Type-Options "nosniff" always;
+        }
+
+        location /mcp-apps/ {
+            try_files $uri =404;
+            add_header Cache-Control "no-cache";
+            add_header Referrer-Policy "no-referrer" always;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+}

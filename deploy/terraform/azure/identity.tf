@@ -72,19 +72,24 @@ resource "azurerm_role_assignment" "api_worker_acr_pull" {
   principal_id         = azurerm_user_assigned_identity.api_worker.principal_id
 }
 
-# ---- web: pulls its own image, reads no secrets -------------------------------
-# Mirrors the AWS stack's aws_iam_role.execution_web (iam.tf) — same
-# isolation reasoning: web is a static SPA/nginx that reads no DSN, no
-# keyvault key, nothing, so it gets no path to any of them.
-resource "azurerm_user_assigned_identity" "web" {
-  name                = "${var.name_prefix}-web"
+# There is no separate web app: the SPA is served by the edge container inside
+# the api app (containerapps.tf), which pulls the web image with api_worker's
+# AcrPull grant above.
+
+# ---- dataverse: Margince's server-to-server identity in Dataverse --------------
+# Attached to api and worker. It holds no Azure role at all: its only use is
+# as a Dataverse APPLICATION USER, which a Power Platform admin creates by hand
+# from the dataverse_identity_client_id output, with a custom security role
+# limited to the tables Margince syncs (README.md). No secret exists for it,
+# and application users need no Dataverse licence.
+#
+# Nothing in Margince calls Dataverse yet (the overlay mode's `dynamics`
+# incumbent is reserved but not implemented, docs/explanation/
+# overlay-augmentation.md); the identity is provisioned now so the Dataverse
+# side can be set up and reviewed ahead of that adapter.
+resource "azurerm_user_assigned_identity" "dataverse" {
+  name                = "${var.name_prefix}-dataverse"
   location            = azurerm_resource_group.this.location
   resource_group_name = azurerm_resource_group.this.name
-  tags                = merge(local.common_tags, { Name = "${var.name_prefix}-web", Component = "security" })
-}
-
-resource "azurerm_role_assignment" "web_acr_pull" {
-  scope                = azurerm_container_registry.this.id
-  role_definition_name = "AcrPull"
-  principal_id         = azurerm_user_assigned_identity.web.principal_id
+  tags                = merge(local.common_tags, { Name = "${var.name_prefix}-dataverse", Component = "security" })
 }

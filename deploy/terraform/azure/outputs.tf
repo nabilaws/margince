@@ -1,10 +1,44 @@
-output "appgw_public_ip" {
-  value = azurerm_public_ip.appgw.ip_address
+output "public_default_fqdn" {
+  description = "CNAME target for public_base_url's host (README.md, DNS step): the api app's ingress, served by its edge container."
+  value       = azurerm_container_app.api.ingress[0].fqdn
 }
 
-output "appgw_fqdn" {
-  description = "Point public_base_url's host at this (a CNAME) — Application Gateway's public IP has no Azure-assigned FQDN of its own the way an ALB gets a dns_name, unlike aws/README.md's own alb_dns_name output."
-  value       = azurerm_public_ip.appgw.fqdn
+output "custom_domain_verification_id" {
+  description = "Value of the asuid.<host> TXT record Container Apps checks before bind_custom_domain can be set to true."
+  value       = azurerm_container_app_environment.this.custom_domain_verification_id
+}
+
+output "environment_static_ip" {
+  description = "Public inbound IP of the Container Apps environment (for an A record, if the DNS zone cannot hold a CNAME at this name)."
+  value       = azurerm_container_app_environment.this.static_ip_address
+}
+
+output "nat_egress_ip" {
+  description = "The one address api and worker call out from. Add it to the Dataverse environment's IP firewall (Managed Environments) and to any partner allowlist."
+  value       = azurerm_public_ip.nat.ip_address
+}
+
+output "entra_tenant_id" {
+  value = local.entra_tenant_id
+}
+
+output "entra_client_id" {
+  description = "Application (client) ID of the Margince app registration. Add this app to the Conditional Access policy that protects Dataverse."
+  value       = local.entra_client_id
+}
+
+output "entra_redirect_uris" {
+  description = "Redirect URIs the app registration must list (set by entra.tf when create_entra_app = true; enter by hand otherwise)."
+  value       = local.entra_redirect_uris
+}
+
+output "dataverse_identity_client_id" {
+  description = "Client ID to register as a Dataverse application user (Power Platform admin center, Environment, Settings, Application users)."
+  value       = azurerm_user_assigned_identity.dataverse.client_id
+}
+
+output "dataverse_identity_principal_id" {
+  value = azurerm_user_assigned_identity.dataverse.principal_id
 }
 
 output "container_app_environment_name" {
@@ -42,4 +76,25 @@ output "key_vault_uri" {
 
 output "log_analytics_workspace_id" {
   value = azurerm_log_analytics_workspace.this.id
+}
+
+output "resource_group_name" {
+  value = azurerm_resource_group.this.name
+}
+
+output "acr_name" {
+  value = azurerm_container_registry.this.name
+}
+
+output "jumpbox_name" {
+  description = "Empty when enable_jumpbox is false."
+  value       = var.enable_jumpbox ? azurerm_linux_virtual_machine.jumpbox[0].name : ""
+}
+
+output "jumpbox_private_ip" {
+  value = var.enable_jumpbox ? azurerm_linux_virtual_machine.jumpbox[0].private_ip_address : ""
+}
+
+output "jumpbox_admin_username" {
+  value = var.jumpbox_admin_username
 }

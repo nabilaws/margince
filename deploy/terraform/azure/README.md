@@ -1,59 +1,90 @@
 # Margince on Azure
 
-Container Apps (api, worker, web), Postgres Flexible Server, Azure Cache for
+Container Apps (api with its edge container, worker), Postgres Flexible Server, Azure Cache for
 Redis, a Storage Account (blob container + Azure Files share), Key Vault, one
-customer-managed key, one Application Gateway (WAF_v2) fronted by an OWASP
-managed-rule WAF policy. See the [shared README](../README.md) for the
+customer-managed key, and an Entra ID app registration in the customer's
+tenant. There is no gateway and no separate web app: the `api` app's ingress
+targets an `edge` nginx container (built from the web image, so it carries the
+SPA) that runs beside `cmd/api` in each replica and forwards api paths to it on
+localhost (`templates/edge-nginx.conf.tftpl`). Staff sign in with Microsoft only; password login is limited to
+`break_glass_cidrs`. See the [shared README](../README.md) for the
 cross-cloud design notes and what is deliberately out of scope (autoscaling
 tuning beyond a floor/ceiling, multi-region/HA, DR runbooks).
 
-**Known gap, read first**: this stack does NOT wire up object storage for the
-product's blobstore feature. Azure Storage accounts speak their own native
-REST API, not S3's — the product's blobstore client
-(`backend/internal/platform/blobstore/s3.go`) is a generic `minio-go` client
-that only speaks S3. `storage.tf` provisions the Storage Account correctly (a
-private, CMK-encrypted, versioned blob container) but `containerapps.tf`
-deliberately leaves `MARGINCE_BLOBSTORE_*` unset — there is nothing correct to
-point it at yet. Closing this needs a second Go-side adapter
-(`azureblob.Store`, using the Azure Blob SDK) that has not been built. This is
-known and out of scope for this Terraform change, not a silent omission.
+**Attachments** are stored with Margince's filesystem provider on an Azure
+Files share mounted read-write at `/app/blobstore` (`MARGINCE_BLOBSTORE_PATH`),
+because the product's object-store client speaks S3 only and Azure Blob
+Storage does not (`storage.tf`). A native Azure Blob adapter would replace it.
+
+**Where to run things.** Key Vault, Storage and the registry have no public
+endpoint in steady state, and Postgres never has one. During setup,
+`operator_ip_allowlist` opens the first three to your own public IP (so
+Terraform, image pushes and the config upload work from a laptop), and the
+jumpbox (`jumpbox.tf`, a small VM inside the VNet with no public IP) covers
+what must reach Postgres, plus the cloud image build. Remove your IP from the
+allowlist when setup is done.
 
 ## 1. Provision
 
+Use a remote state backend (uncomment the `backend "azurerm"` block in
+`versions.tf`): state holds every generated password and the Entra client
+secret, and the jumpbox may need to read outputs too.
+
 ```bash
 cd deploy/terraform/azure
-cp terraform.tfvars.example terraform.tfvars   # fill in public_base_url, admin_bootstrap_password, image_tag
+cp terraform.tfvars.example terraform.tfvars
+#   public_base_url, admin_bootstrap_password, image_tag,
+#   entra_access_group_object_id, break_glass_cidrs,
+#   operator_ip_allowlist = ["$(curl -s https://api.ipify.org)"],
+#   jumpbox_ssh_public_key = "<contents of ~/.ssh/id_ed25519.pub>"
 terraform init
-terraform plan
 
-# Everything EXCEPT Application Gateway and the 3 Container Apps first — the
-# gateway's ssl_certificate references a Key Vault secret ID
-# (tls_certificate_key_vault_secret_id) that only exists once the vault does,
-# and the apps reference image_tag, which nothing has pushed yet.
+# Everything except the Container Apps first: they reference image_tag, which
+# nothing has pushed yet.
 terraform apply \
-  -target=azurerm_key_vault.this -target=azurerm_container_registry.this \
+  -target=azurerm_key_vault_secret.entra_client_secret \
+  -target=azurerm_key_vault_secret.license \
+  -target=azurerm_container_registry.this \
   -target=azurerm_postgresql_flexible_server.this -target=azurerm_redis_cache.this \
-  -target=azurerm_storage_account.this
+  -target=azurerm_storage_share.config -target=azurerm_storage_share.attachments \
+  -target=azurerm_linux_virtual_machine.jumpbox -target=azurerm_bastion_host.developer \
+  -target=azurerm_role_assignment.jumpbox_acr_push
 ```
 
-This creates the VNet, Key Vault, Postgres Flexible Server, Redis cache,
-Storage Account, and ACR. Do steps 2–4 next — import the TLS certificate,
-bootstrap the database, push the images, write `margince.yaml` onto the
-config share — then run a final untargeted `terraform apply` to create the
-Application Gateway and the 3 Container Apps, which by then have a
-certificate, an image to pull, and a database to migrate against.
+This creates the VNet, NAT, Key Vault (with its key and secrets), Postgres,
+Redis, the Storage Account and shares, the registry, the Entra app, and the
+jumpbox with Bastion Developer. Do steps 2–5 next, then run a final
+untargeted `terraform apply` with `bind_custom_domain = false` to create the
+Container Apps. Step 6 binds the domain.
 
-## 2. Import the TLS certificate (once)
+## 2. Entra ID (once)
 
-```bash
-az keyvault certificate import --vault-name "$(terraform output -raw key_vault_uri | sed -E 's#https://([^.]+).*#\1#')" \
-  -n tls-cert -f your-cert.pfx
-```
+The Terraform identity needs Entra's **Application Administrator** role to
+create the app registration (`create_entra_app = true`, the default). If the
+customer will not grant that, an Entra admin creates the app by hand with the
+redirect URIs from `terraform output entra_redirect_uris`, the delegated
+Microsoft Graph permissions listed in `entra.tf`, and a client secret, then
+sets `create_entra_app = false`, `entra_client_id` and `entra_client_secret`.
 
-Set `tls_certificate_key_vault_secret_id` in `terraform.tfvars` to the
-versionless secret ID this prints, then re-run `terraform apply`.
+After the apply that creates the app, an Entra admin:
+
+1. Grants admin consent for the Graph permissions (Enterprise applications →
+   Margince → Permissions), unless `entra_grant_admin_consent = true`.
+2. Adds the app (`terraform output -raw entra_client_id`) to the Conditional
+   Access policy that already protects Dataverse, so MFA and device rules are
+   identical for both.
+3. Confirms "Assignment required" is on and the Dataverse security group is
+   the only assignment.
+
+The client secret rotates on the first apply after
+`entra_secret_rotation_days`; schedule an apply before it lapses.
 
 ## 3. Bootstrap the database (once)
+
+Postgres is reachable only from inside the VNet, so run this **on the
+jumpbox**: Azure portal → the jumpbox VM → Connect → Bastion (SSH, private
+key), then `az login`, clone the repo (step 4, cloud build) and run the
+commands below from `deploy/terraform/azure` with the same remote state.
 
 Postgres Flexible Server's admin login is `pgadmin` (see `postgres.tf` for why
 it is not named `margince_owner`) — Azure grants this login a broad,
@@ -100,63 +131,103 @@ exists as this Terraform-generated value. `sslmode=verify-full` needs no
 Root G2, a public root most client trust stores already carry, unlike RDS's
 own private CA bundle.)
 
-## 4. Push the three images
+## 4. Build and push the images
+
+Two ways, same result in the registry. `<tag>` must equal `image_tag`.
+
+**On your Mac** (Docker with buildx; Colima works):
 
 ```bash
-IMAGE_TAG="<the same value you set for image_tag in terraform.tfvars>"
-
-az acr login --name "$(terraform output -raw acr_login_server | cut -d. -f1)"
-
-for role in api worker web; do
-  docker buildx build --target "$role" \
-    -t "$(terraform output -json acr_repository_names | jq -r .$role):${IMAGE_TAG}" --push .
-done
+colima start                          # if not running
+scripts/build-images.sh local <tag>   # asks: 1) x86 (amd64)  2) ARM (arm64)
 ```
 
-`IMAGE_TAG` must equal `var.image_tag` exactly. Unlike the AWS stack's
-`IMMUTABLE` ECR repos, ACR does not refuse a re-push to the same tag
-(`acr.tf`'s own comment) — picking a real release identifier here is a
-release-discipline convention this stack asks of you, not something the
-registry enforces.
+- **x86 (amd64)** (`scripts/build-local-amd64.sh`) is what Azure runs:
+  Container Apps requires `linux/amd64` images. It cross-builds (Go and the
+  SPA compile natively, only the runtime stages run under emulation) and
+  pushes to the registry, so your IP must be in `operator_ip_allowlist`.
+- **ARM (arm64)** (`scripts/build-local-arm64.sh`) builds natively for running
+  on the Mac, loaded locally as `margince/<role>:<tag>-arm64`. `--push` uploads
+  them as `<tag>-arm64`; they never replace the deployable tag.
+- `--arch amd64` or `--arch arm64` skips the question.
+
+**In Azure, on the jumpbox** (native x86, pushes over the private endpoint
+with the VM's managed identity, no allowlist needed). Once, over Bastion SSH:
+
+```bash
+gh auth login        # or install a read-only deploy key
+git clone <margince repo URL> /opt/margince
+```
+
+Then from your Mac, for every build:
+
+```bash
+scripts/build-images.sh cloud <tag> [git_ref]   # starts the VM if stopped
+```
+
+The build runs through `az vm run-command`, so it needs no SSH and no public
+IP. The jumpbox shuts down every evening (`jumpbox_shutdown_time`).
 
 ## 5. Write `margince.yaml` onto the config share (once)
 
-Terraform provisions the Azure Files share; it does not write into it. From
-any machine with network access to the storage account (this account's
-`public_network_access_enabled = false`, so a VPN/bastion/VNet-peered host is
-required — the same constraint the private endpoint in
-`privateendpoints.tf` exists to enforce):
+With your IP in `operator_ip_allowlist`, upload it from your Mac:
 
 ```bash
 STORAGE_ACCOUNT="$(terraform output -raw storage_account_name)"
 STORAGE_KEY="$(az storage account keys list --account-name "$STORAGE_ACCOUNT" --query '[0].value' -o tsv)"
-
-sudo mount -t cifs "//${STORAGE_ACCOUNT}.file.core.windows.net/${STORAGE_ACCOUNT%data}-config" /mnt/margince-config \
-  -o username="${STORAGE_ACCOUNT}",password="${STORAGE_KEY}",serverino,vers=3.0
-
-sudo cp config/margince.example.yaml /mnt/margince-config/margince.yaml
-# edit /mnt/margince-config/margince.yaml — set password_file to
-# secrets/admin-password (the api's working dir is /app) per docs/deployment.md
-sudo umount /mnt/margince-config
+cp ../../../config/margince.example.yaml margince.yaml
+# edit margince.yaml: workspace, bootstrap_admin (password_file:
+# secrets/admin-password, the api's working dir is /app), seeds.ai_routing
+az storage file upload --account-name "$STORAGE_ACCOUNT" --account-key "$STORAGE_KEY" \
+  --share-name "<name_prefix>-config" --source margince.yaml --path margince.yaml
+rm margince.yaml
 ```
 
-## 6. DNS + first boot
+When setup is finished, set `operator_ip_allowlist = []` and apply: Key Vault,
+Storage and the registry go back to private endpoints only.
 
-Point `public_base_url`'s host at `terraform output -raw appgw_fqdn` (a CNAME)
-or `terraform output -raw appgw_public_ip` (an A record) — the FQDN exists
-only because `appgateway.tf`'s public IP requests one via
-`domain_name_label`; a bare Azure public IP has no DNS name of its own the
-way an ALB's own `dns_name` always does. Once the api Container App can reach a
-healthy `/healthz` through the gateway, it applies migrations and bootstraps
-the organization from `MARGINCE_ADMIN_PASSWORD` — after which, per
-`docs/deployment.md`, remove `bootstrap_admin` from `margince.yaml` and rotate
-the `admin-password` secret to something inert.
+## 6. DNS, certificate + first boot
+
+The custom domain is bound in two passes, because Container Apps checks DNS
+before it accepts the binding:
+
+```bash
+# 1. DNS records (in the customer's zone)
+#    CNAME  crm.example.com        -> $(terraform output -raw public_default_fqdn)
+#    TXT    asuid.crm.example.com  -> $(terraform output -raw custom_domain_verification_id)
+
+# 2. Bind the hostname
+terraform apply -var bind_custom_domain=true   # or set it in terraform.tfvars
+
+# 3. Issue and bind the free managed certificate (azurerm ~> 3.117 cannot).
+#    Use --validation-method HTTP (and an A record to environment_static_ip)
+#    if the host is a zone apex. If the zone has a CAA record, it must allow
+#    DigiCert: 0 issue digicert.com. Keep the api app running: renewals need it.
+az containerapp hostname bind -g <resource-group> -n <name_prefix>-api \
+  --hostname crm.example.com --environment <name_prefix>-env --validation-method CNAME
+```
+
+Once `https://<host>/healthz` answers through the edge container, the api has applied
+migrations and bootstrapped the organization from `MARGINCE_ADMIN_PASSWORD`.
+Per `docs/deployment.md`, then remove `bootstrap_admin` from `margince.yaml`
+and rotate the `admin-password` secret to something inert. Staff accounts are
+invited in Margince with the same email address they have in Entra; Microsoft
+sign-in links to them on first login.
+
+## Moving from the Application Gateway layout
+
+`internal_load_balancer_enabled` cannot change in place, so applying this
+version over the gateway layout replaces the Container Apps environment and
+all three apps. Postgres, Redis, Storage and Key Vault are untouched. Expect
+downtime from the apply until DNS points at the new api app; schedule it, or
+build the new environment under a different `name_prefix` first and switch
+DNS once it answers.
 
 ## 7. Releasing a new version
 
 Build/push new images tagged with the release version, set `image_tag` to
 that version, `terraform apply`. All three Container Apps pick up the new
-revision on the same apply, the same "api/worker/web move together" release
+revision on the same apply (web ships inside the api app's edge container), the same "api/worker/web move together" release
 guard `docs/deployment.md` describes for the AWS stack.
 
 ## Security posture
@@ -176,8 +247,8 @@ the customer key, not encryption itself.
 
 | Hop | Enforcement |
 |---|---|
-| Client → Application Gateway | TLS via the imported certificate (`ssl_certificate`), HTTP redirects to HTTPS |
-| Application Gateway → api/web Container Apps | Plaintext HTTP inside the VNet — matches the product's own architecture, same as the AWS stack's ALB→ECS hop: `cmd/api` serves plain HTTP and terminates TLS ahead of itself |
+| Client → api app (edge container) | TLS at the environment's edge with a free managed certificate; HTTP redirects to HTTPS (`allow_insecure_connections = false`) |
+| edge (nginx) → cmd/api | Plaintext HTTP on localhost inside one replica — `cmd/api` serves plain HTTP and expects TLS to end ahead of it, same as the AWS stack's ALB→ECS hop. `cmd/api`'s port is never exposed by the ingress |
 | Task → Postgres | `require_secure_transport = ON` (server refuses plaintext) + `sslmode=verify-full` on both DSNs — encrypted and authenticated against Postgres Flexible Server's public CA chain, no separate CA bundle to distribute (unlike RDS) |
 | Task → Redis | `minimum_tls_version = "1.2"`, `enable_non_ssl_port = false` — no plaintext port exists to fall back to at all |
 | Task → Storage (config share) | Azure Files over SMB 3.0 with encryption in transit is the default for this account's minimum TLS setting; the mount command in step 5 passes `vers=3.0` accordingly |
@@ -187,13 +258,19 @@ the customer key, not encryption itself.
 `privateendpoints.tf`'s private endpoints, on the one shared
 `private_endpoints` subnet (`network.tf`); ACR is Premium tier specifically
 because it is the only tier supporting both a private endpoint and a
-customer-managed key (`acr.tf`'s own comment); Container Apps run with
-`internal_load_balancer_enabled = true` on their environment, so — like the
-AWS stack's ECS tasks having no public IP — the Application Gateway is this
-stack's one public entry point; api/worker and web each get their own
-user-assigned identity (`identity.tf`), api/worker's scoped to Key Vault
-Secrets User + AcrPull, web's to AcrPull only, mirroring the AWS stack's own
-execution/execution_web split; Key Vault uses `rbac_authorization_enabled =
+customer-managed key (`acr.tf`'s own comment); only the `api` app has
+external ingress and it targets the `edge` container, never `cmd/api` itself;
+`worker` has no ingress — it blocks password login outside `break_glass_cidrs`,
+rate limits auth paths per real client address, and keeps `/metrics`
+private; staff sign-in goes through the customer's Entra tenant (`entra.tf`),
+restricted to one security group by "assignment required" and covered by
+their Conditional Access policy; api/worker share one user-assigned identity
+(`identity.tf`) scoped to Key Vault Secrets User + AcrPull, plus the
+`dataverse` identity that holds no Azure role. The edge container runs in the
+api app, so it shares that app's identities: it cannot read `cmd/api`'s
+environment or secrets, but a compromised nginx could request the same tokens.
+That is the price of dropping the separate web app and its Host rewrite;
+keep the edge image patched with each release; Key Vault uses `rbac_authorization_enabled =
 true` rather than the legacy access-policy model, so every grant in this
 stack is an ordinary `azurerm_role_assignment`, not a second permission model
 to keep in step.
@@ -217,24 +294,17 @@ around):
   line, a wider migration this change does not fold in). `network.tf`'s own
   comment on `azurerm_network_watcher.this` has the full reasoning and the
   upgrade path.
-- **No blobstore adapter** — see this file's own top section.
-- **appgateway.tf's path patterns are a best-effort port** of `alb.tf`'s own
-  ALB wildcard syntax to Application Gateway's — verify each `path_rule`
-  against a real request before relying on it.
-- **CPU-credit alarms have no literal Azure equivalent** — `alarms.tf`
-  watches `cpu_percent` (Postgres) and `serverLoad` (Redis) instead; see that
-  file's own top comment for why neither platform exposes a credit-balance
-  metric the way AWS's T-family burstable instances do. Off by default —
-  gated on `var.enable_deep_monitoring`, mirroring the AWS stack's matching
-  toggle. Log Analytics and every resource's own diagnostic settings stay on
-  regardless; only the alerting layer is optional.
-- **Worker's scale-from-zero is unverified** — `containerapps.tf`'s own
-  comment on `azurerm_container_app.worker`'s `custom_scale_rule` states
-  plainly that a cpu-type KEDA rule combined with `min_replicas = 0` was not
-  confirmed against a live environment; if it does not behave as intended,
-  the fix is bumping `worker_min_replicas` to 1 or moving to a scaler that
-  documents scale-from-zero support (a Redis-stream-depth scaler, given
-  worker's own outbox relay, is the natural one to reach for).
+- **Attachments use Azure Files, not Blob Storage** — see this file's own top section. Upload and read back one attachment after the first deploy.
+- **No managed WAF rule set.** The gateway's OWASP rules were removed to save
+  ~€475/month; the exposed surface is the edge container's nginx, Entra-only staff sign-in
+  and token-protected guest links. Add Azure Front Door Standard in front of
+  web if edge DDoS absorption or country filtering becomes a requirement.
+- **The nginx config is a copy.** `templates/edge-nginx.conf.tftpl` replaces
+  `frontend/nginx.conf` for this deployment; keep their SPA locations in step.
+- **cmd/api sees every request from 127.0.0.1.** Its own per-address rate
+  limits therefore share one bucket per replica; the edge's `limit_req` on the
+  auth paths uses the real client address instead. Closing this in the app
+  means trusting X-Forwarded-For from localhost.
 
 **Left out, deliberately** (see the [shared README](../README.md)):
 autoscaling tuning beyond a floor/ceiling, multi-region/HA, and DR runbooks.

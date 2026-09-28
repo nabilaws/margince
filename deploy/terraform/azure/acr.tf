@@ -14,7 +14,18 @@ resource "azurerm_container_registry" "this" {
   sku                 = "Premium"
   admin_enabled       = false
 
-  public_network_access_enabled = false
+  # Public endpoint only while operator_ip_allowlist is set, so a laptop can
+  # push images (scripts/build-images.sh local); default-deny lets in nothing
+  # else, and pulls from Container Apps keep using the private endpoint.
+  public_network_access_enabled = length(var.operator_ip_allowlist) > 0
+  network_rule_set = [{
+    default_action = "Deny"
+    ip_rule = [for ip in var.operator_ip_allowlist : {
+      action   = "Allow"
+      ip_range = "${ip}/32"
+    }]
+    virtual_network = []
+  }]
   # Routes the registry's own underlying blob-layer traffic (image layers,
   # not just the control-plane API) through the private endpoint below too —
   # Premium-only, and specifically documented as needed once a registry sits

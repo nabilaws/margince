@@ -1,23 +1,15 @@
 # ---------------------------------------------------------------------------
-# KNOWN GAP — read this before assuming the blobstore "just works" here:
+# Attachments: the product's object-store client
+# (backend/internal/platform/blobstore/s3.go) speaks the S3 API only, and
+# Azure Blob Storage does not. Until an Azure Blob adapter exists, Margince
+# stores attachments with its FILESYSTEM provider (blobstore/fs.go) on the
+# attachments Azure Files share below, mounted read-write at /app/blobstore in
+# api and worker (MARGINCE_BLOBSTORE_PATH, containerapps.tf). The blob
+# container stays provisioned but unused, ready for that adapter.
 #
-# The product's blobstore client (backend/internal/platform/blobstore/s3.go)
-# is a generic minio-go client speaking the S3 REST API — the same
-# constraint s3.tf's own top comment states for the AWS stack. Azure Storage
-# accounts do NOT speak the S3 API; they speak their own native REST API
-# (Azure Blob Storage's own protocol, authenticated with an account key or
-# Azure AD, not an S3-style access key/secret pair). Standing up the
-# azurerm_storage_account/azurerm_storage_container below therefore does NOT
-# give this product a working blobstore on Azure as-is: MARGINCE_BLOBSTORE_*
-# is deliberately left unset in containerapps.tf's environment for exactly
-# this reason.
-#
-# Closing this gap needs a second Go-side adapter — an `azureblob.Store`
-# implementing the same interface s3.go does, using the Azure Blob SDK
-# instead of minio-go — which is out of scope for this Terraform change and
-# has not been built. This file provisions the storage correctly and stops
-# there; it does not paper over the client-side gap with a comment claiming
-# the two sides already agree.
+# To verify on first deploy: the filesystem store renames and syncs files;
+# Azure Files over SMB supports both, but upload one attachment and read it
+# back before relying on it.
 # ---------------------------------------------------------------------------
 
 # One storage account for both the blobstore container and the Container
@@ -38,7 +30,7 @@ resource "azurerm_storage_account" "this" {
   account_tier = "Standard"
   # Zone-redundant, not locally-redundant: this stack already commits to
   # zone-redundant HA everywhere else it can (postgres.tf's ZoneRedundant
-  # mode, appgateway.tf's zones) — LRS would make the CRM's one attachment
+  # mode, the zone-redundant Container Apps environment) — LRS would make the CRM's one attachment
   # store the single tier-level exception to that posture. Not GRS/geo
   # redundant: this stack is single-region by design (the shared README's
   # "What this does NOT cover" — no multi-region/HA), so paying for
@@ -46,9 +38,18 @@ resource "azurerm_storage_account" "this" {
   # stack does not have either.
   account_replication_type = "ZRS"
 
-  min_tls_version                 = "TLS1_2"
-  public_network_access_enabled   = false
+  min_tls_version = "TLS1_2"
+  # Public endpoint only while operator_ip_allowlist is set; the network rules
+  # below still deny everyone else. Container Apps reach the shares through
+  # the private endpoint either way.
+  public_network_access_enabled   = length(var.operator_ip_allowlist) > 0
   allow_nested_items_to_be_public = false
+
+  network_rules {
+    default_action = "Deny"
+    bypass         = ["AzureServices"]
+    ip_rules       = var.operator_ip_allowlist
+  }
 
   blob_properties {
     versioning_enabled = true
@@ -129,4 +130,14 @@ resource "azurerm_storage_share" "config" {
   name                 = "${var.name_prefix}-config"
   storage_account_name = azurerm_storage_account.this.name
   quota                = 5
+}
+
+# Margince's filesystem attachment store (MARGINCE_BLOBSTORE_PATH), mounted
+# read-write into api and worker (containerapps.tf). The app's native store
+# speaks S3 only, so until an Azure Blob adapter exists this share is where
+# attachments live; the blob container above stays unused.
+resource "azurerm_storage_share" "attachments" {
+  name                 = "${var.name_prefix}-attachments"
+  storage_account_name = azurerm_storage_account.this.name
+  quota                = var.attachments_share_quota_gb
 }

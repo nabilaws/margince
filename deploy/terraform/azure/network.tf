@@ -31,26 +31,20 @@ resource "azurerm_virtual_network" "this" {
 # public/private subnet PER AVAILABILITY ZONE (network.tf there), one subnet
 # per TIER already covers every zone; only the resources placed in a subnet
 # are individually zone-pinned (postgres.tf's zone, containerapps.tf's
-# zone_redundancy_enabled, appgateway.tf's zones). Four tiers, matching the
+# zone_redundancy_enabled). Three tiers, matching the
 # AWS stack's five security groups minus the one (efs) that has no Azure
 # equivalent tier of its own — see privateendpoints.tf's own comment on why
 # the config-volume share shares the storage-private-endpoints subnet instead
 # of getting one of its own.
 
-resource "azurerm_subnet" "appgw" {
-  # Azure requires an Application Gateway's subnet to contain ONLY Application
-  # Gateways — sharing it with anything else (even another AppGW) is refused
-  # at apply time, not just discouraged.
-  name                 = "${var.name_prefix}-appgw"
-  resource_group_name  = azurerm_resource_group.this.name
-  virtual_network_name = azurerm_virtual_network.this.name
-  address_prefixes     = [cidrsubnet(var.vnet_cidr, 8, 0)]
-}
+# cidrsubnet(var.vnet_cidr, 8, 0) is left unused: it held the Application
+# Gateway subnet, and renumbering the subnets below would force Terraform to
+# replace them.
 
 resource "azurerm_subnet" "containerapps" {
-  # /23 is the Container Apps Environment's own documented minimum for a
-  # Consumption-only environment (containerapps.tf) — smaller is refused at
-  # apply time.
+  # /23: more than the /27 a workload profiles environment needs
+  # (containerapps.tf), kept so the subnet is not replaced and so the
+  # environment has room to scale out replicas.
   name                 = "${var.name_prefix}-containerapps"
   resource_group_name  = azurerm_resource_group.this.name
   virtual_network_name = azurerm_virtual_network.this.name
@@ -88,7 +82,7 @@ resource "azurerm_subnet" "postgres" {
 resource "azurerm_subnet" "private_endpoints" {
   # Shared by every azurerm_private_endpoint in this stack (storage
   # blob+file, Key Vault, ACR, Redis — privateendpoints.tf) — unlike the
-  # appgw/postgres subnets above, private endpoints carry no exclusivity
+  # postgres/containerapps subnets above, private endpoints carry no exclusivity
   # requirement, so one subnet for all of them is the honest floor rather
   # than a separate one per service with nothing to isolate from the
   # others (every private endpoint here is reached by the same caller,
@@ -158,12 +152,19 @@ resource "azurerm_subnet_nat_gateway_association" "containerapps" {
 # the Postgres delegated subnet do not each get their own NIC-level construct
 # to attach a resource-scoped NSG to the way an aws_security_group does.
 
-resource "azurerm_network_security_group" "appgw" {
-  name                = "${var.name_prefix}-appgw"
+resource "azurerm_network_security_group" "containerapps" {
+  name                = "${var.name_prefix}-containerapps"
   location            = azurerm_resource_group.this.location
   resource_group_name = azurerm_resource_group.this.name
-  tags                = merge(local.common_tags, { Name = "${var.name_prefix}-appgw", Component = "network" })
+  tags                = merge(local.common_tags, { Name = "${var.name_prefix}-containerapps", Component = "network" })
 
+  # Public traffic to the api app (the only external ingress) reaches an
+  # external workload profiles environment through its public IP in the
+  # managed resource group, not through this subnet, so these inbound rules
+  # do not filter it (learn.microsoft.com/azure/container-apps/
+  # firewall-integration). They are kept for the platform's HTTP-to-HTTPS
+  # redirect and load balancer probes; intra-subnet traffic between the
+  # environment's components rides the default AllowVnetInBound rule.
   security_rule {
     name                       = "AllowHttpsInbound"
     priority                   = 100
@@ -188,42 +189,15 @@ resource "azurerm_network_security_group" "appgw" {
     destination_address_prefix = "*"
   }
 
-  # Required by Azure for the v2 SKU's own control-plane health/management
-  # traffic — refusing this breaks the gateway, it is not optional hardening
-  # left off, per Microsoft's own Application Gateway NSG guidance.
   security_rule {
-    name                       = "AllowGatewayManagerInbound"
+    name                       = "AllowAzureLoadBalancerInbound"
     priority                   = 120
     direction                  = "Inbound"
     access                     = "Allow"
-    protocol                   = "Tcp"
+    protocol                   = "*"
     source_port_range          = "*"
-    destination_port_range     = "65200-65535"
-    source_address_prefix      = "GatewayManager"
-    destination_address_prefix = "*"
-  }
-}
-
-resource "azurerm_subnet_network_security_group_association" "appgw" {
-  subnet_id                 = azurerm_subnet.appgw.id
-  network_security_group_id = azurerm_network_security_group.appgw.id
-}
-
-resource "azurerm_network_security_group" "containerapps" {
-  name                = "${var.name_prefix}-containerapps"
-  location            = azurerm_resource_group.this.location
-  resource_group_name = azurerm_resource_group.this.name
-  tags                = merge(local.common_tags, { Name = "${var.name_prefix}-containerapps", Component = "network" })
-
-  security_rule {
-    name                       = "AllowFromAppGateway"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "8080"
-    source_address_prefix      = azurerm_subnet.appgw.address_prefixes[0]
+    destination_port_range     = "*"
+    source_address_prefix      = "AzureLoadBalancer"
     destination_address_prefix = "*"
   }
 }
@@ -301,7 +275,7 @@ resource "azurerm_subnet_network_security_group_association" "private_endpoints"
 # stack's one CloudWatch Log Group per service (rds.tf, elasticache.tf,
 # iam.tf, alb.tf) — Log Analytics + a per-resource diagnostic setting is
 # Azure's own idiom for centralizing this, so containerapps.tf's Container
-# App Environment, this file's own flow log, postgres.tf, and appgateway.tf
+# App Environment, this file's own flow log and postgres.tf
 # all send here instead of each minting its own destination.
 resource "azurerm_log_analytics_workspace" "this" {
   name                = "${var.name_prefix}-logs"

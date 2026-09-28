@@ -2,13 +2,6 @@
 
 # ---- Required, no default ----------------------------------------------------
 
-# Versionless Key Vault secret ID of a PFX certificate covering the host in
-# public_base_url, already imported into this stack's Key Vault (keyvault.tf's
-# own comment has the `az keyvault certificate import` command — the vault
-# must exist, i.e. a first `terraform apply` targeting just it, before this
-# can be filled in).
-tls_certificate_key_vault_secret_id = "https://margince-kv.vault.azure.net/secrets/tls-cert"
-
 # MARGINCE_PUBLIC_BASE_URL — the canonical external scheme+host.
 public_base_url = "https://crm.example.com"
 
@@ -23,6 +16,24 @@ admin_bootstrap_password = "change-me-before-first-boot"
 # registry enforces the way ECR does. No default on purpose.
 image_tag = "2026.09.01"
 
+# Object ID of the Entra security group that already gates the customer's
+# Dataverse environment. Only its members can sign in to Margince.
+entra_access_group_object_id = "00000000-0000-0000-0000-000000000000"
+
+# Admin network(s) allowed to use password login (the break-glass account).
+# Everyone else must sign in with Microsoft.
+break_glass_cidrs = ["203.0.113.10/32"]
+
+# false on the first apply; true once the asuid TXT and CNAME records exist.
+bind_custom_domain = false
+
+# Your public IP while you set up or push images from a laptop
+# (curl -s https://api.ipify.org). Set back to [] afterwards.
+operator_ip_allowlist = ["203.0.113.20"]
+
+# SSH public key for the jumpbox (enable_jumpbox, default true).
+jumpbox_ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+
 # ---- Optional — shown with their defaults ------------------------------------
 
 # azure_region             = "westeurope"
@@ -33,10 +44,8 @@ image_tag = "2026.09.01"
 # az_count                 = 2
 # api_min_replicas         = 2
 # api_max_replicas         = 4
-# worker_min_replicas      = 0
+# worker_min_replicas      = 1
 # worker_max_replicas      = 3
-# web_min_replicas         = 2
-# web_max_replicas         = 4
 # api_cpu                  = 0.5
 # api_memory               = "1Gi"
 # worker_cpu               = 0.5
@@ -52,8 +61,19 @@ image_tag = "2026.09.01"
 # db_backup_retention_days = 7
 # redis_sku_name           = "Standard"
 # redis_capacity           = 1
-# appgw_min_capacity       = 2
-# appgw_max_capacity       = 10
+# auth_rate_limit_per_minute = 30
+# create_entra_app         = true   # false: pass entra_client_id / entra_client_secret from a hand-made app
+# entra_client_id          = ""
+# entra_client_secret      = ""
+# entra_secret_rotation_days = 180
+# entra_grant_admin_consent = false # true needs Privileged Role Administrator for the Terraform identity
 # license_token            = ""
 # enable_deep_monitoring   = false  # true adds the action group + metric alerts (alarms.tf)
 # alert_email              = ""
+# enable_jumpbox             = true
+# enable_bastion_developer   = true
+# jumpbox_vm_size            = "Standard_B2ms"
+# jumpbox_admin_username     = "margince"
+# jumpbox_shutdown_time      = "2000"
+# jumpbox_shutdown_timezone  = "W. Europe Standard Time"
+# attachments_share_quota_gb = 100
